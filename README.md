@@ -16,41 +16,79 @@ Every stage is a generator or a queue, so memory holds at most about 500 issues 
 
 ## Architecture
 
-Two threads connected by one queue. Each box names the technology it uses and what it is for.
-
-```mermaid
-flowchart LR
-    API["GitHub REST API<br/>HTTPS + JSON<br/>source of the issues"]
-
-    subgraph T1["Thread 1: fetcher"]
-        FETCH["Fetcher<br/>urllib, Link-header paging<br/>+ retry + rate limit<br/>gets pages, drops PRs"]
-    end
-
-    Q["Queue<br/>queue.Queue, max 500<br/>hands issues across threads,<br/>slows the fetcher if the writer lags"]
-
-    subgraph T2["Thread 2: main"]
-        XFORM["Transform<br/>pure Python function<br/>adds the 4 derived fields"]
-        SINK["CSV sink<br/>csv module, one row at a time<br/>writes the 3 files"]
-    end
-
-    FILES["issues.csv<br/>issue_labels.csv<br/>issue_assignees.csv<br/>database-ready output"]
-    AGG["Aggregate<br/>csv + statistics<br/>groups by label"]
-    BYLABEL["by_label.csv<br/>bonus summary"]
-
-    API -->|"JSON pages"| FETCH
-    FETCH -->|"Issue"| Q
-    Q -->|"Issue"| XFORM
-    XFORM -->|"EnrichedIssue"| SINK
-    SINK -->|"rows"| FILES
-    FILES -->|"read back"| AGG
-    AGG --> BYLABEL
-```
-
-Plain-text version of the same flow:
+Two threads connected by one queue. Each box names its module, the technology it uses and what it is for. Data flows from top to bottom.
 
 ```
-GitHub API --> [Fetcher] --> [Queue, max 500] --> [Transform] --> [CSV sink] --> 3 CSV files --> [Aggregate] --> by_label.csv
-               thread 1       between threads     thread 2         thread 2                       reads the CSVs
+      ┌────────────────────────────────────────────────────────────────┐
+      │ GitHub REST API                                                │
+      │ Technology: HTTPS + JSON                                       │
+      │ Use: source of the issues (open and closed, PRs included)      │
+      └────────────────────────────────────────────────────────────────┘
+                                       │
+                                       │ JSON pages
+                                       ▼
+╔════════════════════════════════════════════════════════════════════════════╗
+║ THREAD 1: FETCHER                                                          ║
+║                                                                            ║
+║   ┌────────────────────────────────────────────────────────────────────┐   ║
+║   │ Fetcher        sources/http, retry, rate_limit, github             │   ║
+║   │ Technology: urllib, Link-header paging, exponential backoff        │   ║
+║   │ Use: downloads page after page, retries failures, waits out        │   ║
+║   │      the rate limit, drops pull requests, applies --limit,         │   ║
+║   │      turns each payload into an Issue                              │   ║
+║   └────────────────────────────────────────────────────────────────────┘   ║
+╚════════════════════════════════════════════════════════════════════════════╝
+                                       │
+                                       │ Issue
+                                       ▼
+    ┌────────────────────────────────────────────────────────────────────┐
+    │ Queue          pipeline.py                                         │
+    │ Technology: queue.Queue, bounded to 500 issues                     │
+    │ Use: hands issues from thread 1 to thread 2; blocks the fetcher    │
+    │      when the writer falls behind, so memory stays flat            │
+    └────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       │ Issue
+                                       ▼
+╔════════════════════════════════════════════════════════════════════════════╗
+║ THREAD 2: MAIN                                                             ║
+║                                                                            ║
+║     ┌────────────────────────────────────────────────────────────────┐     ║
+║     │ Transform      transforms/derived.py                           │     ║
+║     │ Technology: one pure Python function, datetime maths           │     ║
+║     │ Use: adds open_age_days, days_since_update,                    │     ║
+║     │      is_unassigned, is_stale                                   │     ║
+║     └────────────────────────────────────────────────────────────────┘     ║
+║                                      │                                     ║
+║                                      ▼                                     ║
+║     ┌────────────────────────────────────────────────────────────────┐     ║
+║     │ CSV sink       sinks/csv_sink.py                               │     ║
+║     │ Technology: csv module, one row at a time                      │     ║
+║     │ Use: writes the three CSV files below                          │     ║
+║     └────────────────────────────────────────────────────────────────┘     ║
+╚════════════════════════════════════════════════════════════════════════════╝
+                                       │
+                                       │ rows
+                                       ▼
+      ┌────────────────────────────────────────────────────────────────┐
+      │ 3 CSV files    issues.csv                                      │
+      │                issue_labels.csv                                │
+      │                issue_assignees.csv                             │
+      │ Use: normalized, database-ready (UTF-8, ISO 8601 UTC)          │
+      └────────────────────────────────────────────────────────────────┘
+                                       │
+                                       │ read back
+                                       ▼
+      ┌────────────────────────────────────────────────────────────────┐
+      │ Aggregate      aggregate.py                                    │
+      │ Technology: csv + statistics, streaming merge join             │
+      │ Use: counts and medians per label                              │
+      └────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+      ┌────────────────────────────────────────────────────────────────┐
+      │ by_label.csv   bonus: where work piles up or goes stale        │
+      └────────────────────────────────────────────────────────────────┘
 ```
 
 `pipeline.py` starts the fetcher thread, owns the queue and runs the main thread. `cli.py` and `config.py` read the options and choose the concrete source and sink.
