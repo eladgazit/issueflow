@@ -52,6 +52,12 @@ def read(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+def find(out: Path, table: str) -> Path:
+    """The single file of `table` inside the daily partition folder."""
+    (path,) = out.glob(f"as_of=*/{table}_*.csv")
+    return path
+
+
 def run(tmp_path: Path, client: FakeClient, *args: str) -> int:
     return main(["--out", str(tmp_path), "--as-of", "2025-03-01T00:00:00Z", *args], client=client)  # type: ignore[arg-type]
 
@@ -66,25 +72,35 @@ def test_end_to_end_writes_all_four_files(tmp_path: Path, capsys: pytest.Capture
     )
     assert run(tmp_path, client) == 0
 
-    issues = read(tmp_path / "issues.csv")
+    issues = read(find(tmp_path, "issues"))
     assert [r["number"] for r in issues] == ["1", "3"]  # PR 2 excluded
     assert issues[0]["open_age_days"] == "59"
     assert issues[0]["days_since_update"] == "28"
     assert issues[0]["is_stale"] == "false"  # 28 days is within the 30-day limit
     assert issues[1]["open_age_days"] == ""
     assert issues[1]["is_unassigned"] == "false"
-    assert read(tmp_path / "issue_labels.csv") == [
+    assert read(find(tmp_path, "issue_labels")) == [
         {"issue_number": "1", "label": "bug"},
         {"issue_number": "3", "label": "bug"},
     ]
-    by_label = read(tmp_path / "by_label.csv")
+    by_label = read(find(tmp_path, "by_label"))
     assert by_label[0]["label"] == "bug" and by_label[0]["total"] == "2"
     assert "wrote 2 issues" in capsys.readouterr().out
 
 
+def test_files_land_in_the_as_of_partition_with_a_timestamp(tmp_path: Path) -> None:
+    run(tmp_path, FakeClient(ok(raw(1))))
+    folder = tmp_path / "as_of=2025-03-01"  # from --as-of 2025-03-01T00:00:00Z
+    names = sorted(f.name for f in folder.iterdir())
+    assert len(names) == 4
+    stamp = names[0].rsplit("_", 1)[1].removesuffix(".csv")
+    assert len(stamp) == 16 and stamp.endswith("Z")
+    assert names == sorted(f"{t}_{stamp}.csv" for t in ("issues", "issue_labels", "issue_assignees", "by_label"))
+
+
 def test_as_of_is_stamped_on_every_row(tmp_path: Path) -> None:
     run(tmp_path, FakeClient(ok(raw(1), raw(2))))
-    assert {r["as_of"] for r in read(tmp_path / "issues.csv")} == {"2025-03-01T00:00:00Z"}
+    assert {r["as_of"] for r in read(find(tmp_path, "issues"))} == {"2025-03-01T00:00:00Z"}
 
 
 def test_limit_caps_output_and_requests(tmp_path: Path) -> None:
@@ -93,7 +109,7 @@ def test_limit_caps_output_and_requests(tmp_path: Path) -> None:
         ok(raw(3)),
     )
     assert run(tmp_path, client, "--limit", "2") == 0
-    assert len(read(tmp_path / "issues.csv")) == 2
+    assert len(read(find(tmp_path, "issues"))) == 2
     assert len(client.calls) == 1
 
 

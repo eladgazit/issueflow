@@ -55,11 +55,19 @@ A source yields typed `Issue` objects lazily. A pipeline moves them through a pu
 - **Cost:** the 60 requests per hour limit (about 6,000 issues). Adding `Authorization: Bearer <token>` is a few lines in `HttpClient` and raises the limit to 5,000 requests per hour; no other layer would change.
 
 ### 8. Normalized CSV output
-- **Choice:** three files: `issues.csv`, `issue_labels.csv`, `issue_assignees.csv`.
+- **Choice:** three tables, written as three files: `issues`, `issue_labels`, `issue_assignees`.
 - **Why:** labels and assignees are one-to-many. Putting several values in one cell would force every consumer to parse a delimiter and would make "issues with label X" awkward in SQL. Child files load as ordinary tables joined on `issue_number`.
 - **Format:** UTF-8, header row, ISO 8601 UTC timestamps with second precision, `true`/`false` booleans, empty string for null. The `csv` module handles quoting, so commas, quotes, newlines and emoji in titles round-trip.
 - **Columns:** core metadata only. The issue body is excluded: it is large, multi-line and rarely needed for these metrics.
 - **Cost:** three files to keep in step. `CsvSink` writes them together, in the same issue order.
+
+#### Where the files are stored
+- **Choice:** `<out>/as_of=YYYY-MM-DD/<table>_<YYYYMMDDTHHMMSSZ>.csv`: a daily partition folder named after the run's `as_of` date, and file names made of the table name plus the creation timestamp.
+- **Why:** the partition folder is the Hive convention, so databases and query engines treat `as_of` as a column and can load or prune by day. Keeping every run's files (instead of overwriting one `out/` folder) preserves history and lets two snapshots be compared. The creation timestamp tells runs on the same day apart, and all files of one run share it so they can be matched.
+- **Why the table name stays in the file name:** three files cannot all be named by a bare timestamp, because they would collide, so each name is `table + timestamp`.
+- **Folder vs file time:** the folder follows `as_of` (the data's reference time, which can be set with `--as-of`); the file name follows the real creation time. They differ when a run uses a past `as_of`.
+- **Never overwrite:** files are opened in exclusive mode, so a clash raises an error instead of silently replacing data.
+- **Cost:** folders grow with each run, and "the latest run" means the newest timestamp. Cleanup of old runs is left to the operator.
 
 ### 9. Derived fields: pure, whole days, injected `as_of`
 - **Choice:** `enrich(issue, as_of)` is a pure function. Day counts are whole days, floored. `as_of` defaults to the run start and is written on every row.
@@ -72,13 +80,13 @@ A source yields typed `Issue` objects lazily. A pipeline moves them through a pu
 - **Note:** `updated_at` is GitHub's last-activity time (comments, labels and similar count). "Stale" therefore means no activity of any kind, not only no edit to the issue text.
 
 ### 10. Aggregate by label, as a streaming merge join
-- **Choice:** `aggregate_by_label` reads `issues.csv` and `issue_labels.csv` together and writes `by_label.csv`.
+- **Choice:** `aggregate_by_label` reads one run's issues and labels files together and writes a `by_label` file with the same timestamp in the same folder.
 - **Why these metrics:**
   - `total`, `open`: how big an area is and how much of it is still open.
   - `stale`, `unassigned`: where work is neglected or has no owner.
   - `median_open_age_days`: how long open work has been waiting; the median is not distorted by a few very old issues.
   - `median_days_to_close`: how quickly an area gets resolved.
-- **How it avoids a lookup table:** `CsvSink` writes child rows in the same order as `issues.csv`, so the two files can be read side by side. A label file out of order raises an error instead of giving wrong numbers.
+- **How it avoids a lookup table:** `CsvSink` writes child rows in the same order as the issues file, so the two files can be read side by side. A label file out of order raises an error instead of giving wrong numbers.
 - **Cost:** memory holds per-label counters plus an integer list per label for the medians, so it grows with the number of labelled issues (small integers, a few hundred kilobytes for this repository), not with row size. Issues without labels are not counted. A very large input would call for an approximate median.
 
 ## Extensibility
@@ -92,14 +100,14 @@ A source yields typed `Issue` objects lazily. A pipeline moves them through a pu
 
 ## Testing approach
 
-- 137 tests run in under a second with no network: a fake HTTP opener, and fake clock, sleep and random.
+- 143 tests run in under a second with no network: a fake HTTP opener, and fake clock, sleep and random.
 - Boundaries are tested explicitly: stale at 30 versus 31 days, closed issues, empty assignees, `--limit` stopping early, retries giving up, rate-limit wait versus fail-fast, a full queue, and errors crossing the thread boundary in both directions.
 - A real run against the API (150 issues, two requests) was done by hand and is shown in the README.
 
 ## Known limitations and next steps
 
-- **No resume.** A failed or stopped run starts over and overwrites the files. A checkpoint (last `Link` URL or `created_at`) would fix it.
-- **Output is not atomic.** A failed run leaves partial files. Writing to a temporary directory and renaming on success would make runs all-or-nothing.
+- **No resume.** A failed or stopped run starts over and writes a new set of files beside the partial ones. A checkpoint (last `Link` URL or `created_at`) would fix it.
+- **Output is not atomic.** A failed run leaves partial files in the daily folder, and nothing marks them as incomplete. Writing to a temporary name and renaming on success would make runs all-or-nothing.
 - **Sequential fetching.** With a token, a small pool of fetch threads could raise throughput, at the cost of the ordering and error-handling points above.
 - **Snapshot semantics.** Issues that change, close or are transferred while a run is in progress may appear in their state at fetch time. `as_of` records when the run began, not when each issue was read.
 - **Approximate memory claim.** The pipeline holds about 500 issues; the aggregate holds per-label integer lists. Neither depends on the full dataset size in the way loading all rows would, but the aggregate is not constant-memory.

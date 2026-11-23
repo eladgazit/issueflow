@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 
-from issueflow.aggregate import BY_LABEL_FILE, aggregate_by_label
+from issueflow.aggregate import BY_LABEL_TABLE, aggregate_by_label
 from issueflow.config import Settings
 from issueflow.pipeline import run_pipeline
 from issueflow.sinks.csv_sink import CsvSink
@@ -65,9 +65,10 @@ def main(argv: Sequence[str] | None = None, *, client: HttpClient | None = None)
         limiter=RateLimiter(max_wait=settings.rate_limit_max_wait),
     )
     try:
-        with CsvSink(settings.out_dir) as sink:
+        with CsvSink(settings.out_dir, settings.as_of) as sink:
             written = run_pipeline(source.iter_issues(), partial(enrich, as_of=settings.as_of), sink)
-        labels = aggregate_by_label(settings.out_dir)
+        by_label_path = sink.path_for(BY_LABEL_TABLE)
+        labels = aggregate_by_label(sink.issues_path, sink.labels_path, by_label_path)
     except RateLimitExceeded as exc:
         print(f"error: {exc} Output in {settings.out_dir} is incomplete.", file=sys.stderr)
         return 1
@@ -78,5 +79,5 @@ def main(argv: Sequence[str] | None = None, *, client: HttpClient | None = None)
         print("interrupted; output is incomplete", file=sys.stderr)
         return 130
 
-    print(f"wrote {written} issues to {settings.out_dir}/ and {labels} labels to {BY_LABEL_FILE}")
+    print(f"wrote {written} issues and {labels} labels to {sink.directory}/ (files stamped {sink.stamp})")
     return 0

@@ -4,9 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from issueflow.sinks.csv_sink import ISSUES_FILE, LABELS_FILE
-
-BY_LABEL_FILE = "by_label.csv"
+BY_LABEL_TABLE = "by_label"
 BY_LABEL_COLUMNS = (
     "label",
     "total",
@@ -43,18 +41,17 @@ def _days_to_close(row: dict[str, str]) -> int | None:
     return max(0, int(seconds // _SECONDS_PER_DAY))
 
 
-def aggregate_by_label(out_dir: Path | str) -> int:
-    """Read issues.csv and issue_labels.csv from `out_dir` and write by_label.csv; return rows written.
+def aggregate_by_label(issues_path: Path | str, labels_path: Path | str, output_path: Path | str) -> int:
+    """Read the issues and labels CSVs of one run and write the by-label CSV; return rows written.
 
-    Both files are streamed together as a merge join: CsvSink writes issue_labels.csv in the same
-    order as issues.csv, so no issue lookup table is needed. Memory holds only per-label counters
+    Both files are streamed together as a merge join: CsvSink writes the labels file in the same
+    order as the issues file, so no issue lookup table is needed. Memory holds only per-label counters
     and the integer lists the medians need. Issues without labels do not appear.
     """
-    directory = Path(out_dir)
     stats: dict[str, _LabelStats] = {}
     with (
-        (directory / ISSUES_FILE).open(encoding="utf-8", newline="") as issues_file,
-        (directory / LABELS_FILE).open(encoding="utf-8", newline="") as labels_file,
+        Path(issues_path).open(encoding="utf-8", newline="") as issues_file,
+        Path(labels_path).open(encoding="utf-8", newline="") as labels_file,
     ):
         labels = csv.DictReader(labels_file)
         pending = next(labels, None)
@@ -79,10 +76,13 @@ def aggregate_by_label(out_dir: Path | str) -> int:
                 if to_close is not None:
                     entry.days_to_close.append(to_close)
         if pending is not None:
-            raise ValueError(f"{LABELS_FILE} is not in the same order as {ISSUES_FILE} (stuck at issue {pending['issue_number']})")
+            raise ValueError(
+                f"{Path(labels_path).name} is not in the same order as {Path(issues_path).name} "
+                f"(stuck at issue {pending['issue_number']})"
+            )
 
     rows = sorted(stats.items(), key=lambda item: (-item[1].total, item[0]))
-    with (directory / BY_LABEL_FILE).open("w", encoding="utf-8", newline="") as out:
+    with Path(output_path).open("w", encoding="utf-8", newline="") as out:
         writer = csv.writer(out)
         writer.writerow(BY_LABEL_COLUMNS)
         for name, s in rows:

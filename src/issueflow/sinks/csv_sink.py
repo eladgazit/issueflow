@@ -1,13 +1,14 @@
 import csv
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, Self
 
 from issueflow.models import EnrichedIssue
 
-ISSUES_FILE = "issues.csv"
-LABELS_FILE = "issue_labels.csv"
-ASSIGNEES_FILE = "issue_assignees.csv"
+ISSUES_TABLE = "issues"
+LABELS_TABLE = "issue_labels"
+ASSIGNEES_TABLE = "issue_assignees"
 
 ISSUE_COLUMNS = (
     "number",
@@ -69,27 +70,54 @@ def issue_row(item: EnrichedIssue) -> list[str]:
     ]
 
 
+def partition_dir(root: Path | str, as_of: datetime) -> Path:
+    """The daily partition folder for a run: <root>/as_of=YYYY-MM-DD (the as_of date in UTC)."""
+    return Path(root) / f"as_of={as_of.astimezone(UTC):%Y-%m-%d}"
+
+
+def file_stamp(created: datetime) -> str:
+    """Creation timestamp used in file names, e.g. 20261123T090233Z."""
+    return f"{created.astimezone(UTC):%Y%m%dT%H%M%SZ}"
+
+
 class CsvSink:
     """Streams enriched issues into three normalized CSV files, one row at a time.
 
-    Existing files in `out_dir` are overwritten. Rows are written as they arrive, so memory
-    use does not depend on the number of issues.
+    Files go in a daily partition folder named after `as_of` (<out_dir>/as_of=YYYY-MM-DD/) and are
+    named <table>_<creation timestamp>.csv, for example issues_20261123T090233Z.csv. All files of
+    one run share the same timestamp. Files are never overwritten: a second run on the same day
+    adds new files beside the earlier ones. Rows are written as they arrive, so memory use does
+    not depend on the number of issues.
     """
 
-    def __init__(self, out_dir: Path | str) -> None:
-        directory = Path(out_dir)
-        directory.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        out_dir: Path | str,
+        as_of: datetime,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self.directory = partition_dir(out_dir, as_of)
+        self.stamp = file_stamp(clock())
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.issues_path = self.path_for(ISSUES_TABLE)
+        self.labels_path = self.path_for(LABELS_TABLE)
+        self.assignees_path = self.path_for(ASSIGNEES_TABLE)
         self._files: list[IO[str]] = []
         try:
-            self._issues = self._open(directory / ISSUES_FILE, ISSUE_COLUMNS)
-            self._labels = self._open(directory / LABELS_FILE, LABEL_COLUMNS)
-            self._assignees = self._open(directory / ASSIGNEES_FILE, ASSIGNEE_COLUMNS)
+            self._issues = self._open(self.issues_path, ISSUE_COLUMNS)
+            self._labels = self._open(self.labels_path, LABEL_COLUMNS)
+            self._assignees = self._open(self.assignees_path, ASSIGNEE_COLUMNS)
         except BaseException:
             self.close()
             raise
 
+    def path_for(self, table: str) -> Path:
+        """Path of a table's file for this run, e.g. path_for("by_label") for the aggregate."""
+        return self.directory / f"{table}_{self.stamp}.csv"
+
     def _open(self, path: Path, columns: tuple[str, ...]) -> Any:
-        file = path.open("w", encoding="utf-8", newline="")
+        file = path.open("x", encoding="utf-8", newline="")  # "x": never overwrite an existing file
         self._files.append(file)
         writer = csv.writer(file)
         writer.writerow(columns)

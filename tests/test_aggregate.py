@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from issueflow.aggregate import BY_LABEL_COLUMNS, aggregate_by_label
+from issueflow.aggregate import BY_LABEL_COLUMNS, BY_LABEL_TABLE, aggregate_by_label
 from issueflow.models import Issue
 from issueflow.sinks.csv_sink import CsvSink
 from issueflow.transforms.derived import enrich
@@ -43,18 +43,28 @@ def closed(number: int, days_open: int, **overrides: object) -> Issue:
     )
 
 
+def new_sink(tmp_path: Path) -> CsvSink:
+    return CsvSink(tmp_path, AS_OF, clock=lambda: AS_OF)
+
+
+def aggregate(sink: CsvSink) -> Path:
+    out = sink.path_for(BY_LABEL_TABLE)
+    aggregate_by_label(sink.issues_path, sink.labels_path, out)
+    return out
+
+
 def run(tmp_path: Path, *issues: Issue) -> dict[str, dict[str, str]]:
-    with CsvSink(tmp_path) as sink:
+    with new_sink(tmp_path) as sink:
         for item in issues:
             sink.write(enrich(item, AS_OF))
-    aggregate_by_label(tmp_path)
-    with (tmp_path / "by_label.csv").open(encoding="utf-8", newline="") as f:
+    with aggregate(sink).open(encoding="utf-8", newline="") as f:
         return {row["label"]: row for row in csv.DictReader(f)}
 
 
 def test_header_and_empty_input(tmp_path: Path) -> None:
     assert run(tmp_path) == {}
-    header = (tmp_path / "by_label.csv").read_text().strip().split(",")
+    (path,) = tmp_path.glob("as_of=*/by_label_*.csv")
+    header = path.read_text().strip().split(",")
     assert tuple(header) == BY_LABEL_COLUMNS
 
 
@@ -127,22 +137,22 @@ def test_rows_sorted_by_total_then_name(tmp_path: Path) -> None:
         make(2, labels=("c",)),
         make(3, labels=("c",)),
     )
-    with (tmp_path / "by_label.csv").open(encoding="utf-8", newline="") as f:
+    (path,) = tmp_path.glob("as_of=*/by_label_*.csv")
+    with path.open(encoding="utf-8", newline="") as f:
         assert [row["label"] for row in csv.DictReader(f)] == ["c", "a", "b"]
 
 
 def test_returns_number_of_label_rows(tmp_path: Path) -> None:
-    with CsvSink(tmp_path) as sink:
+    with new_sink(tmp_path) as sink:
         sink.write(enrich(make(1, labels=("a", "b")), AS_OF))
-    assert aggregate_by_label(tmp_path) == 2
+    assert aggregate_by_label(sink.issues_path, sink.labels_path, sink.path_for(BY_LABEL_TABLE)) == 2
 
 
 def test_out_of_order_label_file_is_rejected(tmp_path: Path) -> None:
-    with CsvSink(tmp_path) as sink:
+    with new_sink(tmp_path) as sink:
         sink.write(enrich(make(1, labels=("a",)), AS_OF))
         sink.write(enrich(make(2, labels=("b",)), AS_OF))
-    labels = tmp_path / "issue_labels.csv"
-    header, *rows = labels.read_text().splitlines()
-    labels.write_text("\n".join([header, *reversed(rows)]) + "\n")
+    header, *rows = sink.labels_path.read_text().splitlines()
+    sink.labels_path.write_text("\n".join([header, *reversed(rows)]) + "\n")
     with pytest.raises(ValueError, match="not in the same order"):
-        aggregate_by_label(tmp_path)
+        aggregate_by_label(sink.issues_path, sink.labels_path, sink.path_for(BY_LABEL_TABLE))
