@@ -1,79 +1,129 @@
-import queue
-import threading
-from collections.abc import Callable, Iterable
+import logging
+import uuid
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
 
+from issueflow.messaging.messages import IssueMessage, Message, RunEnd, RunStart
 from issueflow.models import EnrichedIssue, Issue
 from issueflow.sinks.base import Sink
 
-DEFAULT_QUEUE_SIZE = 500  # about five GitHub pages of issues
-_POLL_SECONDS = 0.1  # how often a blocked producer re-checks the stop flag
-_JOIN_SECONDS = 5.0
-_DONE = object()
+log = logging.getLogger(__name__)
 
 
-class _Failure:
-    """Carries an exception from the producer thread to the main thread."""
-
-    def __init__(self, exc: BaseException) -> None:
-        self.exc = exc
+class PipelineError(Exception):
+    """A run could not be completed."""
 
 
-def run_pipeline(
+class IncompleteRunError(PipelineError):
+    """The messages stopped before the run's END marker arrived."""
+
+
+class RunCountMismatch(PipelineError):
+    """The END marker's count differs from the issues received, so some were lost."""
+
+
+class Publisher(Protocol):
+    def publish(self, message: Message) -> None: ...
+
+    def flush(self) -> None: ...
+
+
+class Reader(Protocol):
+    def __iter__(self) -> Iterator[Message]: ...
+
+    def commit(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    run_id: str
+    count: int
+
+
+@dataclass(frozen=True)
+class ConsumeResult:
+    run_id: str
+    as_of: datetime
+    count: int
+    sink: Sink  # already closed; kept so callers can find the files it wrote
+
+
+def produce(
     issues: Iterable[Issue],
-    transform: Callable[[Issue], EnrichedIssue],
-    sink: Sink,
+    publisher: Publisher,
     *,
-    queue_size: int = DEFAULT_QUEUE_SIZE,
-) -> int:
-    """Move issues from `issues` through `transform` into `sink`; return how many were written.
+    as_of: datetime,
+    repo: str,
+    run_id: str | None = None,
+) -> RunSummary:
+    """Publish START, one message per issue, then END with the count; wait for the acks.
 
-    A producer thread pulls from `issues` (the slow, network-bound side) into a bounded queue,
-    while this thread transforms and writes. The bound caps memory and stops the producer from
-    running far ahead of the writer. An error in the producer is re-raised here, and an error
-    here stops the producer. The caller owns `sink` and is responsible for closing it.
+    If `issues` raises, END is never sent, so a consumer cannot mistake a partial run for a
+    complete one.
     """
-    if queue_size < 1:
-        raise ValueError("queue_size must be >= 1")
-    buffer: queue.Queue[object] = queue.Queue(maxsize=queue_size)
-    stop = threading.Event()
+    run_id = run_id or uuid.uuid4().hex
+    publisher.publish(RunStart(run_id, as_of, repo))
+    count = 0
+    for issue in issues:
+        count += 1
+        publisher.publish(IssueMessage(run_id, count, issue))
+    publisher.publish(RunEnd(run_id, count))
+    publisher.flush()
+    return RunSummary(run_id, count)
 
-    def put(item: object) -> bool:
-        """Block until there is room; give up (False) once the consumer has stopped."""
-        while not stop.is_set():
-            try:
-                buffer.put(item, timeout=_POLL_SECONDS)
-                return True
-            except queue.Full:
-                continue
-        return False
 
-    def produce() -> None:
-        iterator = iter(issues)
-        try:
-            for issue in iterator:
-                if not put(issue):
-                    return
-            put(_DONE)
-        except BaseException as exc:  # noqa: BLE001 - forwarded to the consumer, not swallowed
-            put(_Failure(exc))
-        finally:
-            close = getattr(iterator, "close", None)
-            if close is not None:
-                close()
+def consume(
+    reader: Reader,
+    make_sink: Callable[[RunStart], Sink],
+    transform: Callable[[Issue, datetime], EnrichedIssue],
+    *,
+    run_id: str | None = None,
+) -> ConsumeResult:
+    """Read one run, write it to a sink, and commit the reader's position.
 
-    producer = threading.Thread(target=produce, name="issueflow-fetch", daemon=True)
-    producer.start()
-    written = 0
+    Reads the first run found, or only the run named by `run_id`. Messages before a START and
+    messages of other runs are ignored. A new START while a run is open abandons the unfinished
+    one. The reader is committed only after the sink is closed, so a crash means the run is read
+    again rather than skipped.
+    """
+    run: RunStart | None = None
+    sink: Sink | None = None
+    count = 0
+    last_seq = 0
     try:
-        while True:
-            item = buffer.get()
-            if item is _DONE:
-                break
-            if isinstance(item, _Failure):
-                raise item.exc
-            sink.write(transform(item))  # type: ignore[arg-type]
-            written += 1
+        for message in reader:
+            if isinstance(message, RunStart):
+                if run_id is not None and message.run_id != run_id:
+                    continue  # not the run we were asked for
+                if run is not None and message.run_id == run.run_id:
+                    continue  # duplicate START from a producer retry
+                if sink is not None:
+                    log.warning("run %s never ended; abandoning it for run %s", run.run_id, message.run_id)  # type: ignore[union-attr]
+                    sink.close()
+                run, sink, count, last_seq = message, make_sink(message), 0, 0
+            elif run is None or sink is None or message.run_id != run.run_id:
+                continue
+            elif isinstance(message, IssueMessage):
+                if message.seq <= last_seq:
+                    continue  # duplicate from a producer retry
+                sink.write(transform(message.issue, run.as_of))
+                count += 1
+                last_seq = message.seq
+            elif isinstance(message, RunEnd):
+                if message.count != count:
+                    raise RunCountMismatch(
+                        f"run {run.run_id}: the producer sent {message.count} issues but {count} arrived"
+                    )
+                sink.close()
+                reader.commit()
+                return ConsumeResult(run.run_id, run.as_of, count, sink)
+        if run is None:
+            raise IncompleteRunError("no run found: the topic had no START message before the reader timed out")
+        raise IncompleteRunError(
+            f"run {run.run_id} has no END message after {count} issues; the producer may have failed"
+        )
     finally:
-        stop.set()
-        producer.join(timeout=_JOIN_SECONDS)
-    return written
+        if sink is not None:
+            sink.close()

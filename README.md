@@ -1,22 +1,24 @@
 # issueflow
 
-Streams the open and closed issues of `microsoft/vscode` from the GitHub REST API (pull requests excluded), adds four derived fields to each issue, and writes CSV files ready for database import. Python 3.12, standard library plus pytest only.
+Streams the open and closed issues of `microsoft/vscode` from the GitHub REST API (pull requests excluded), adds four derived fields to each issue, and writes CSV files ready for database import. Python 3.12. The only third-party packages are `kafka-python-ng` (the Kafka client) and `pytest`; Kafka itself runs in Docker.
 
-**Status:** complete. Fetch, transform, CSV sink, pipeline, aggregate, config and CLI are built and covered by tests, and a live run against the GitHub API is shown under [Demo](#demo). Design decisions and trade-offs are in [DESIGN.md](DESIGN.md).
+**Status:** complete. Fetch, Kafka publish and consume, transform, CSV sink, aggregate, config and CLI are built and covered by tests, and a live run against the GitHub API and a real Kafka broker is shown under [Demo](#demo). Design decisions and trade-offs are in [DESIGN.md](DESIGN.md).
 
 ## How it works in one minute
 
-1. A **fetch thread** asks GitHub for issues, 100 per page, and follows the `Link: rel="next"` header until the last page.
-2. Each request goes through a **rate limiter** (wait for the quota to reset, or stop with a clear message) and a **retry policy** (backoff on 5xx, network errors and timeouts).
-3. Pull requests are dropped, `--limit` is applied, and each payload becomes a typed `Issue`.
-4. Issues cross a **bounded queue** to the **main thread**, which computes the derived fields and appends rows to three CSV files in a daily folder named `as_of=YYYY-MM-DD`.
-5. A final **aggregate** step streams those CSVs and writes `by_label_<timestamp>.csv` in the same folder.
+There are two programs that never talk to each other directly. They only share a Kafka topic.
 
-Every stage is a generator or a queue, so memory holds at most about 500 issues (the queue size) at a time, not the 19,000+ issues of the full dataset.
+1. **Producer** (`issueflow produce`): a fetcher asks GitHub for issues, 100 per page, following the `Link: rel="next"` header. Each request goes through a **rate limiter** (wait for the quota to reset, or stop with a clear message) and a **retry policy** (backoff on 5xx, network errors and timeouts). Pull requests are dropped and `--limit` is applied.
+2. The producer sends a **START** message, then **one message per issue**, then an **END** message with the issue count, to the Kafka topic `issueflow.issues`.
+3. **Consumer** (`issueflow consume`): reads one run from START to END, checks that the count matches, computes the derived fields and appends rows to three CSV files in a daily folder named `as_of=YYYY-MM-DD`.
+4. After the files are written, the consumer commits its Kafka position and runs the **aggregate** step, which writes `by_label_<timestamp>.csv` in the same folder.
+5. `issueflow run` does steps 1 to 4 in one command, for convenience.
+
+Kafka holds the data between the two programs, so memory in each program stays small: one issue at a time, not the 19,000+ issues of the full dataset. Because the data is stored in Kafka, either program can be stopped and restarted without refetching or losing issues.
 
 ## Architecture
 
-Two threads connected by one queue. Each box names its module, the technology it uses and what it is for. Data flows from top to bottom.
+Two processes joined by a Kafka topic. Each box names its module, the technology it uses and what it is for. Data flows from top to bottom.
 
 ```
       ┌────────────────────────────────────────────────────────────────┐
@@ -28,7 +30,7 @@ Two threads connected by one queue. Each box names its module, the technology it
                                        │ JSON pages
                                        ▼
 ╔════════════════════════════════════════════════════════════════════════════╗
-║ THREAD 1: FETCHER                                                          ║
+║ PRODUCER PROCESS:  issueflow produce                                       ║
 ║                                                                            ║
 ║   ┌────────────────────────────────────────────────────────────────────┐   ║
 ║   │ Fetcher        sources/http, retry, rate_limit, github             │   ║
@@ -37,22 +39,40 @@ Two threads connected by one queue. Each box names its module, the technology it
 ║   │      the rate limit, drops pull requests, applies --limit,         │   ║
 ║   │      turns each payload into an Issue                              │   ║
 ║   └────────────────────────────────────────────────────────────────────┘   ║
+║                                      │                                     ║
+║                                      ▼                                     ║
+║   ┌────────────────────────────────────────────────────────────────────┐   ║
+║   │ Publisher      pipeline.produce + messaging/kafka.py               │   ║
+║   │ Technology: kafka-python-ng KafkaProducer, JSON messages           │   ║
+║   │ Use: sends a START marker, one message per issue, then an          │   ║
+║   │      END marker with the count; waits for the broker to ack        │   ║
+║   └────────────────────────────────────────────────────────────────────┘   ║
 ╚════════════════════════════════════════════════════════════════════════════╝
                                        │
-                                       │ Issue
+                                       │ JSON messages
                                        ▼
     ┌────────────────────────────────────────────────────────────────────┐
-    │ Queue          pipeline.py                                         │
-    │ Technology: queue.Queue, bounded to 500 issues                     │
-    │ Use: hands issues from thread 1 to thread 2; blocks the fetcher    │
-    │      when the writer falls behind, so memory stays flat            │
+    │ KAFKA         docker-compose.yml                                   │
+    │ Technology: Apache Kafka 3.9, single broker, KRaft (no ZooKeeper)  │
+    │ Topic: issueflow.issues, 1 partition (keeps issues in order)       │
+    │ Use: replaces an in-process queue. Stores the issues between the   │
+    │      two processes, so the fetcher and the consumer run apart,     │
+    │      either can restart, and a run can be read again               │
     └────────────────────────────────────────────────────────────────────┘
                                        │
-                                       │ Issue
+                                       │ JSON messages
                                        ▼
 ╔════════════════════════════════════════════════════════════════════════════╗
-║ THREAD 2: MAIN                                                             ║
+║ CONSUMER PROCESS:  issueflow consume                                       ║
 ║                                                                            ║
+║   ┌────────────────────────────────────────────────────────────────────┐   ║
+║   │ Reader         pipeline.consume + messaging/kafka.py               │   ║
+║   │ Technology: kafka-python-ng KafkaConsumer, group issueflow-csv     │   ║
+║   │ Use: reads one run from START to END, checks the count, and        │   ║
+║   │      commits its position only after the CSV files are written     │   ║
+║   └────────────────────────────────────────────────────────────────────┘   ║
+║                                      │                                     ║
+║                                      ▼                                     ║
 ║     ┌────────────────────────────────────────────────────────────────┐     ║
 ║     │ Transform      transforms/derived.py                           │     ║
 ║     │ Technology: one pure Python function, datetime maths           │     ║
@@ -94,7 +114,7 @@ Two threads connected by one queue. Each box names its module, the technology it
       └────────────────────────────────────────────────────────────────┘
 ```
 
-`pipeline.py` starts the fetcher thread, owns the queue and runs the main thread. `cli.py` and `config.py` read the options and choose the concrete source and sink.
+`cli.py` and `config.py` read the options and build each side. `pipeline.py` holds the two loops (`produce` and `consume`) and knows nothing about Kafka or CSV: it only uses a publisher, a reader and a sink. `messaging/kafka.py` is the only file that imports the Kafka library.
 
 ### Modules at a glance
 
@@ -106,14 +126,17 @@ Two threads connected by one queue. Each box names its module, the technology it
 | `sources/retry.py` | Retries temporary failures (5xx, network errors, timeouts) with growing, randomized delays. | exponential backoff, full jitter |
 | `sources/rate_limit.py` | Reads GitHub's quota headers and waits for the reset, or stops if the wait is too long. | `X-RateLimit-*`, `Retry-After` headers |
 | `sources/github.py` | Fetches every page of issues, skips pull requests, applies `--limit`, and parses each into an `Issue`. | `Link` header paging, `datetime` |
+| `messaging/messages.py` | Defines the three message types (START, issue, END) and turns them into JSON bytes and back. | `json`, `dataclasses` |
+| `messaging/kafka.py` | Publishes messages to the Kafka topic and reads them back; the only code that touches Kafka. | `kafka-python-ng` |
+| `pipeline.py` | `produce` sends START, issues and END; `consume` reads one run, checks the count and writes it to a sink. | plain loops over iterables |
 | `transforms/derived.py` | Computes `open_age_days`, `days_since_update`, `is_unassigned` and `is_stale` for one issue. | pure function, `datetime` |
 | `sinks/base.py` | Defines the `Sink` contract: write one item, close. | `typing.Protocol` |
 | `sinks/csv_sink.py` | Writes each issue as one row in the issues file plus child rows in the labels and assignees files, inside the daily `as_of=` folder. | `csv` module, streaming, `pathlib` |
-| `pipeline.py` | Runs fetcher and writer at the same time and passes errors between the two threads. | `threading`, `queue.Queue` |
 | `aggregate.py` | Reads one run's issues and labels CSVs and writes per-label counts and medians to a `by_label` CSV. | `csv`, `statistics`, merge join |
 | `config.py` | Holds the validated run settings: repo, limit, `as_of`, output folder, wait cap. | frozen `dataclass` |
-| `cli.py` | Parses options, wires everything together, prints a summary, and turns failures into exit codes. | `argparse` |
+| `cli.py` | Provides the `produce`, `consume` and `run` commands, wires everything together, and turns failures into exit codes. | `argparse` |
 | `__main__.py` | Lets you run the tool as `python -m issueflow`. | standard module entry point |
+| `docker-compose.yml` | Starts a single Kafka broker (KRaft mode) and creates the topic. | Docker Compose, Apache Kafka 3.9 |
 
 ### What one page request does
 
@@ -141,6 +164,18 @@ GitHubIssuesSource._get(url, params)
 |---|---|
 | `Issue` | `number`, `id`, `title`, `state` (`open`/`closed`), `state_reason`, `author`, `created_at`, `updated_at`, `closed_at`, `comments`, `milestone`, `html_url`, `labels` (tuple of names), `assignees` (tuple of logins). All datetimes are timezone-aware UTC. |
 | `EnrichedIssue` | `issue`, `as_of`, plus the four derived fields below. |
+
+### Kafka messages
+
+One topic, `issueflow.issues`, with **one partition** so that messages keep the order they were sent in (the aggregate step relies on this order). Every message is a UTF-8 JSON object with a `type` and the `run_id` of the run that sent it.
+
+| `type` | Sent | Other fields |
+|---|---|---|
+| `start` | once, first | `as_of` (ISO 8601 UTC), `repo` |
+| `issue` | once per issue | `seq` (1, 2, 3... within the run) and `issue` (the fields of `Issue`, datetimes as ISO 8601 UTC, labels and assignees as lists) |
+| `end` | once, last | `count` (number of issue messages sent) |
+
+The consumer reads one run: it ignores anything before a `start`, ignores messages of other runs, and stops at the matching `end`. It checks `count` against what it received, so a lost message is an error, not a silent gap. If Kafka retries a send and an issue arrives twice, the second copy is skipped because its `seq` was already seen. (Issue numbers cannot be used for this: in the real data, issue 64 was created after issue 65.)
 
 ## Derived fields
 
@@ -253,11 +288,23 @@ Frozen dataclasses `Issue` and `EnrichedIssue` (see Data model). Frozen so a sta
 - `ISSUE_COLUMNS`, `LABEL_COLUMNS`, `ASSIGNEE_COLUMNS` and the `*_TABLE` name constants: the schema in one place.
 - **Why:** writing row by row keeps memory flat. Child files avoid packing several values into one cell, so the CSVs import into a relational database without parsing. A dated partition folder with timestamped files keeps every run and lets a database load one day, or one run, at a time.
 
+### `src/issueflow/messaging/messages.py` (built)
+- `RunStart(run_id, as_of, repo)`, `IssueMessage(run_id, seq, issue)`, `RunEnd(run_id, count)`: the three message types (see Kafka messages).
+- `encode(message) -> bytes` and `decode(data) -> message`: JSON in UTF-8. `decode` raises `MessageError` for bad JSON or an unknown `type`.
+- **Why:** the wire format lives in one place and has no Kafka dependency, so it is tested without a broker and could be reused with another message system.
+
+### `src/issueflow/messaging/kafka.py` (built)
+- `KafkaSettings(bootstrap_servers="localhost:9092", topic="issueflow.issues", group_id="issueflow-csv", idle_timeout=120.0)`.
+- `KafkaPublisher(settings)`: `publish(message)` sends one message (key = `run_id`, `acks="all"`, one request in flight so order is kept); `flush()` waits until the broker has acknowledged everything and raises if any send failed; `close()`.
+- `KafkaReader(settings)`: iterating yields decoded messages from the last committed position, ending after `idle_timeout` seconds of silence; `commit()` saves the position; `close()`. Auto-commit is off, so the position moves only when the caller says so.
+- `KafkaUnavailableError`: raised when no broker answers, with a message that says to run `docker compose up -d`.
+- **Why:** this is the only file that imports `kafka`. Both classes accept a ready-made producer or consumer, so tests use fakes and need no broker. Manual commit gives at-least-once reading: a crash before the commit means the run is read again, never skipped.
+
 ### `src/issueflow/pipeline.py` (built)
-- `run_pipeline(issues, transform, sink, *, queue_size=500) -> int`: moves issues from any iterable through `transform` into `sink` and returns how many were written. A **producer thread** pulls from `issues` into a bounded `queue.Queue`; the calling thread takes items off the queue, transforms and writes them.
-- A sentinel marks the end of the stream. An exception in the producer travels through the queue and is **re-raised in the main thread**. An exception in the main thread (sink or transform) sets a stop flag so the producer exits instead of blocking on a full queue, and closes the source generator.
-- The caller owns the sink and closes it (`with CsvSink(...)`).
-- **Why:** network waits and disk writes overlap, and the bound caps memory at about `queue_size` issues. The function knows nothing about GitHub or CSV, so it works with any source and sink.
+- `produce(issues, publisher, *, as_of, repo, run_id=None) -> RunSummary`: publishes START, one message per issue, then END with the count, flushes, and returns the `run_id` and count. A failure while fetching stops before END, so the consumer never mistakes a half run for a whole one.
+- `consume(reader, make_sink, transform) -> ConsumeResult`: reads messages until the END of the first run it sees. On START it calls `make_sink(start)` to open the files, for each issue it calls `transform(issue, as_of)` and writes the result to the sink, and at END it checks the count, closes the sink and calls `reader.commit()`. Messages of other runs are ignored. A new START while a run is open abandons the unfinished one. Duplicate messages are dropped by `seq`. If the messages stop before END it raises `IncompleteRunError`; if the count is wrong it raises `RunCountMismatch`.
+- Neither function knows about Kafka, GitHub or CSV: they only use a publisher, a reader and a sink.
+- **Why:** the control flow (markers, count check, commit only after the files are written) is the part worth testing, and it is testable with plain lists.
 
 ### `src/issueflow/aggregate.py` (built)
 - `aggregate_by_label(issues_path, labels_path, output_path) -> int`: reads one run's issues and labels files and writes the by-label file, returning the number of label rows.
@@ -270,41 +317,81 @@ Frozen dataclasses `Issue` and `EnrichedIssue` (see Data model). Frozen so a sta
 - **Why:** one validated object instead of loose arguments, so the rest of the code never re-checks them.
 
 ### `src/issueflow/cli.py` and `__main__.py` (built)
-- `main(argv=None, *, client=None) -> int`: parses `--repo`, `--limit`, `--as-of`, `--out`, `--max-wait`, builds the source, runs the pipeline inside a `CsvSink`, then runs the aggregate on that run's files. `client` lets tests inject a fake HTTP client.
-- Exit codes: `0` success, `1` for a rate limit that is too long or a failed request (one-line message, no traceback), `2` for invalid options, `130` on Ctrl-C. A failed run says the output is incomplete.
+- Three commands: `issueflow produce` (fetch and publish), `issueflow consume` (read and write CSVs, then aggregate) and `issueflow run` (produce, then consume).
+- `main(argv=None, *, client=None, publisher=None, reader=None) -> int`: `client`, `publisher` and `reader` let tests inject fakes.
+- Options: `produce` takes `--repo`, `--limit`, `--as-of`, `--max-wait`; `consume` takes `--out`, `--idle-timeout`; all three take `--bootstrap-servers` and `--topic`; `run` takes all of them.
+- Exit codes: `0` success, `1` for a rate limit that is too long, a failed request, an unreachable Kafka or an incomplete run (one-line message, no traceback), `2` for invalid options, `130` on Ctrl-C.
 - `parse_as_of(text)`: ISO 8601; a value without a timezone is taken as UTC.
 - `python -m issueflow` runs `main()`.
 
+### `docker-compose.yml` (built)
+- `kafka`: one Apache Kafka 3.9 broker in KRaft mode (no ZooKeeper), published on `localhost:9092`, with a healthcheck.
+- `kafka-init`: a one-shot container that waits for the broker and creates the topic `issueflow.issues` with one partition.
+- Data is kept in a Docker volume, so the topic survives `docker compose stop`; `docker compose down -v` erases it.
+
 ### `tests/` (built)
-- Mirrors `src/`. Tests inject a fake `opener`, clock, `sleep` and `random`, so they run in milliseconds and never touch the network.
-- The suite (143 tests) covers retry counts and give-up, the rate-limit wait and fail-fast paths, Link pagination, PR filtering, limit edge cases, the stale boundary at 30 versus 31 days, CSV formatting, the merge join, and the pipeline's bounded queue and error propagation in both directions.
+- Mirrors `src/`. Tests inject a fake `opener`, clock, `sleep` and `random`, plus a fake Kafka producer and consumer, so they run in milliseconds and need neither the network nor a broker.
+- The suite covers retry counts and give-up, the rate-limit wait and fail-fast paths, Link pagination, PR filtering, limit edge cases, the stale boundary at 30 versus 31 days, CSV formatting, the merge join, the message format, and the produce/consume loops: markers, count check, duplicates, abandoned runs, idle timeout, and commit only after a successful write.
 
 ## Design principles
 
-- **Streaming:** generators and a bounded queue, never a full in-memory dataset.
-- **Overlap:** fetching and writing run at the same time in two threads.
+- **Decoupled:** the fetcher and the CSV writer share only a Kafka topic, so each can run, fail and restart alone.
+- **Streaming:** one issue at a time in each program, never a full in-memory dataset.
+- **Safe to retry:** the consumer commits its Kafka position only after the files are written, and checks the issue count against the END marker.
 - **Deterministic:** `as_of`, the clock, sleep and randomness are injected.
-- **Extensible:** a new source, derived field or output format changes one file, because stages meet at small interfaces.
+- **Extensible:** a new source, derived field or output format changes one file, because stages meet at small interfaces; Kafka is confined to one file.
 
 ## Run and test
 
-Python 3.12 is required (the code uses `str | None` and generic function syntax).
+Python 3.12 and Docker are required. Install the project and start Kafka once:
 
 ```
-.venv/bin/python -m pytest                                          # all tests, no network needed
-PYTHONPATH=src .venv/bin/python -m issueflow --limit 200 --out out  # small live sample
-PYTHONPATH=src .venv/bin/python -m issueflow --out out              # everything (19k+ issues)
+.venv/bin/pip install -e . pytest      # installs kafka-python-ng
+docker compose up -d                   # starts Kafka and creates the topic
 ```
 
-Options: `--repo owner/name`, `--limit N`, `--as-of 2026-01-31T00:00:00Z`, `--out DIR` (root folder; default `out`), `--max-wait SECONDS`. Without a token the GitHub API allows 60 requests per hour, about 6,000 issues at 100 per page. The fetcher waits for a quota reset only if it is within `--max-wait` seconds (60 by default); otherwise it stops with a clear message and says the output is incomplete. A full run of all 19k+ issues therefore needs `--max-wait 3600`, which lets it sleep through the roughly three hourly resets. See [DESIGN.md](DESIGN.md) for why there is no token support.
+Then either two programs, in two terminals (or one after the other):
+
+```
+.venv/bin/issueflow produce --limit 200            # fetch from GitHub and publish to Kafka
+.venv/bin/issueflow consume --out out              # read from Kafka and write the CSVs
+```
+
+or both in one command:
+
+```
+.venv/bin/issueflow run --limit 200 --out out      # small live sample
+.venv/bin/issueflow run --out out                  # everything (19k+ issues)
+```
+
+Tests need neither Kafka nor the network:
+
+```
+.venv/bin/python -m pytest
+```
+
+Stop Kafka with `docker compose stop` (keeps the data) or `docker compose down -v` (erases it).
+
+Options: `--repo owner/name`, `--limit N`, `--as-of 2026-01-31T00:00:00Z`, `--out DIR` (root folder; default `out`), `--max-wait SECONDS`, `--bootstrap-servers HOST:PORT` (default `localhost:9092`), `--topic NAME`, `--idle-timeout SECONDS` (consumer; default 120). Without a token the GitHub API allows 60 requests per hour, about 6,000 issues at 100 per page. The fetcher waits for a quota reset only if it is within `--max-wait` seconds (60 by default); otherwise it stops with a clear message and nothing is ended in Kafka, so a consumer would wait and then report an incomplete run. A full run of all 19k+ issues therefore needs `--max-wait 3600`, which lets it sleep through the roughly three hourly resets, and a consumer `--idle-timeout` above 3600 if it is started at the same time. See [DESIGN.md](DESIGN.md) for why there is no token support.
 
 ## Demo
 
-A real run, `issueflow --limit 150 --out out` (2 requests, about 2 seconds):
+A real run against the GitHub API and a real Kafka broker (`docker compose up -d` first). The producer fetched 150 issues in 2 requests, then the consumer read them back:
 
 ```
-wrote 150 issues and 31 labels to out/as_of=2026-11-23/ (files stamped 20261123T091159Z)
+$ issueflow produce --limit 150
+published 150 issues to topic issueflow.issues (run 6804852e65f44b71818a09507d57bc07)
+
+$ issueflow consume --out out
+wrote 150 issues and 31 labels to out/as_of=2026-11-23/ (files stamped 20261123T092102Z)
 ```
+
+Things that were checked on that broker:
+
+- **Same group again:** `issueflow consume` a second time finds nothing new (`no run found`), because the position was committed after the files were written.
+- **Replay:** `issueflow consume --group replay-1` reads the same 150 issues again and writes a new set of files, because a new consumer group starts from the beginning of the topic.
+- **One command:** `issueflow run --limit 20` published 20 issues and wrote the files from that run only.
+- **Kafka stopped:** both commands stop with `cannot reach Kafka at localhost:9092; start it with docker compose up -d`.
 
 First rows of the by-label file (these are the oldest issues in the repository, because pages are fetched oldest first):
 
@@ -319,10 +406,10 @@ First rows of the by-label file (these are the oldest issues in the repository, 
 Files created by that run:
 
 ```
-out/as_of=2026-11-23/issues_20261123T091159Z.csv
-out/as_of=2026-11-23/issue_labels_20261123T091159Z.csv
-out/as_of=2026-11-23/issue_assignees_20261123T091159Z.csv
-out/as_of=2026-11-23/by_label_20261123T091159Z.csv
+out/as_of=2026-11-23/issues_20261123T092102Z.csv
+out/as_of=2026-11-23/issue_labels_20261123T092102Z.csv
+out/as_of=2026-11-23/issue_assignees_20261123T092102Z.csv
+out/as_of=2026-11-23/by_label_20261123T092102Z.csv
 ```
 
 The output directory `out/` is gitignored.
