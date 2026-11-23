@@ -2,7 +2,7 @@
 
 Streams the open and closed issues of `microsoft/vscode` from the GitHub REST API (pull requests excluded), adds four derived fields to each issue, and writes CSV files ready for database import. Python 3.12, standard library plus pytest only.
 
-**Status:** the fetch side (HTTP, retry, rate limit, GitHub source), the derived-field transform and the CSV sink are built and tested. The pipeline, aggregate, config and CLI are designed below and marked `planned`.
+**Status:** complete. Fetch, transform, CSV sink, pipeline, aggregate, config and CLI are built and covered by tests, and a live run against the GitHub API is shown under [Demo](#demo). Design decisions and trade-offs are in [DESIGN.md](DESIGN.md).
 
 ## How it works in one minute
 
@@ -16,7 +16,7 @@ Every stage is a generator or a queue, so memory holds about one page (100 issue
 
 ## Architecture
 
-`built` boxes are solid, `planned` boxes are dashed.
+Green boxes are the stages; the dashed arrows show which module starts and drains each thread.
 
 ```mermaid
 flowchart LR
@@ -67,10 +67,10 @@ flowchart LR
     PIPE -.->|"starts"| FETCH
     PIPE -.->|"drains"| MAIN
 
-    classDef built fill:#e8f4ea,stroke:#2e7d32,color:#1b1b1b;
-    classDef planned fill:#fff8e1,stroke:#b28704,color:#1b1b1b,stroke-dasharray: 5 5;
-    class SRC,LIM,RET,HTTP,ENR,SINK built;
-    class Q,AGG,CLI,CFG,PIPE planned;
+    classDef stage fill:#e8f4ea,stroke:#2e7d32,color:#1b1b1b;
+    classDef glue fill:#e3f2fd,stroke:#1565c0,color:#1b1b1b;
+    class SRC,LIM,RET,HTTP,ENR,SINK,AGG stage;
+    class Q,CLI,CFG,PIPE glue;
 ```
 
 The same flow in plain text:
@@ -92,7 +92,7 @@ The same flow in plain text:
                                                                   │          │
                                                                   └────┬─────┘
                                                                        ▼
-                                                  aggregate (planned) ──► by_label.csv
+                                                  aggregate ──► by_label.csv
 ```
 
 ### What one page request does
@@ -143,7 +143,7 @@ UTF-8, header row, ISO 8601 UTC timestamps with second precision (`2025-02-01T08
 | `issue_labels.csv` | `issue_number`, `label` |
 | `issue_assignees.csv` | `issue_number`, `assignee` |
 
-## Bonus: aggregate by label (`by_label.csv`, planned)
+## Bonus: aggregate by label (`by_label.csv`)
 
 One row per label, to show where the backlog is concentrated and neglected.
 
@@ -211,22 +211,31 @@ Frozen dataclasses `Issue` and `EnrichedIssue` (see Data model). Frozen so a sta
 - `ISSUE_COLUMNS`, `LABEL_COLUMNS`, `ASSIGNEE_COLUMNS`, and the file-name constants: the schema in one place, reused by the aggregate step.
 - **Why:** writing row by row keeps memory flat. Child files avoid packing several values into one cell, so the CSVs import into a relational database without parsing.
 
-### `src/issueflow/pipeline.py` (planned)
-- Runs the source in a **producer thread** that puts `Issue` objects on a bounded `queue.Queue`. The main thread takes them, calls `enrich`, and writes through the sink. A sentinel value ends the queue, and an exception in the producer is re-raised in the main thread so a failed run is never silent.
-- **Why:** network waits and disk writes overlap, and the bounded queue stops the fetcher from running far ahead of the writer.
+### `src/issueflow/pipeline.py` (built)
+- `run_pipeline(issues, transform, sink, *, queue_size=500) -> int`: moves issues from any iterable through `transform` into `sink` and returns how many were written. A **producer thread** pulls from `issues` into a bounded `queue.Queue`; the calling thread takes items off the queue, transforms and writes them.
+- A sentinel marks the end of the stream. An exception in the producer travels through the queue and is **re-raised in the main thread**. An exception in the main thread (sink or transform) sets a stop flag so the producer exits instead of blocking on a full queue, and closes the source generator.
+- The caller owns the sink and closes it (`with CsvSink(...)`).
+- **Why:** network waits and disk writes overlap, and the bound caps memory at about `queue_size` issues. The function knows nothing about GitHub or CSV, so it works with any source and sink.
 
-### `src/issueflow/aggregate.py` (planned)
-- Streams `issues.csv` and `issue_labels.csv` and writes `by_label.csv` with the metrics above. It keeps only small per-label counters and value lists for the medians in memory, a documented trade-off.
+### `src/issueflow/aggregate.py` (built)
+- `aggregate_by_label(out_dir) -> int`: reads `issues.csv` and `issue_labels.csv` and writes `by_label.csv`, returning the number of label rows.
+- The two files are streamed together as a **merge join**: `CsvSink` writes `issue_labels.csv` in the same order as `issues.csv`, so no issue lookup table is needed. Memory holds per-label counters and the integer lists for the medians. A label file out of order raises `ValueError`.
+- Rows are sorted by `total` (largest first), then label name. Issues without labels do not appear.
+- **Why:** it reads the CSV output, as the task asks, and shows that the output schema is enough to answer questions without going back to the API.
 
-### `src/issueflow/config.py` (planned)
-- A frozen `Settings` dataclass: repository, limit, `as_of`, output directory, rate-limit wait cap.
+### `src/issueflow/config.py` (built)
+- `Settings`: a frozen dataclass with `repo` (`owner/name`), `limit`, `as_of` (default: now, UTC), `out_dir` and `rate_limit_max_wait`. It validates its input (repo format, non-negative limit, timezone-aware `as_of`).
+- **Why:** one validated object instead of loose arguments, so the rest of the code never re-checks them.
 
-### `src/issueflow/cli.py` (planned)
-- The `issueflow` command (`pyproject.toml` entry point `issueflow.cli:main`). Options: `--repo`, `--limit`, `--as-of`, `--out`.
+### `src/issueflow/cli.py` and `__main__.py` (built)
+- `main(argv=None, *, client=None) -> int`: parses `--repo`, `--limit`, `--as-of`, `--out`, `--max-wait`, builds the source, runs the pipeline inside a `CsvSink`, then runs the aggregate. `client` lets tests inject a fake HTTP client.
+- Exit codes: `0` success, `1` for a rate limit that is too long or a failed request (one-line message, no traceback), `2` for invalid options, `130` on Ctrl-C. A failed run says the output is incomplete.
+- `parse_as_of(text)`: ISO 8601; a value without a timezone is taken as UTC.
+- `python -m issueflow` runs `main()`.
 
 ### `tests/` (built for existing modules)
 - Mirrors `src/`. Tests inject a fake `opener`, clock, `sleep` and `random`, so they run in milliseconds and never touch the network.
-- The suite covers retry counts and give-up, the rate-limit wait and fail-fast paths, Link pagination, PR filtering, limit edge cases, and the stale boundary at 30 versus 31 days.
+- The suite (137 tests) covers retry counts and give-up, the rate-limit wait and fail-fast paths, Link pagination, PR filtering, limit edge cases, the stale boundary at 30 versus 31 days, CSV formatting, the merge join, and the pipeline's bounded queue and error propagation in both directions.
 
 ## Design principles
 
@@ -237,10 +246,32 @@ Frozen dataclasses `Issue` and `EnrichedIssue` (see Data model). Frozen so a sta
 
 ## Run and test
 
+Python 3.12 is required (the code uses `str | None` and generic function syntax).
+
 ```
-.venv/bin/python -m pytest
+.venv/bin/python -m pytest                                          # all tests, no network needed
+PYTHONPATH=src .venv/bin/python -m issueflow --limit 200 --out out  # small live sample
+PYTHONPATH=src .venv/bin/python -m issueflow --out out              # everything (19k+ issues)
 ```
 
-Python 3.12 is required (the code uses `str | None` and generic function syntax). The command `issueflow --limit 200 --out out/` arrives with the planned modules.
+Options: `--repo owner/name`, `--limit N`, `--as-of 2026-01-31T00:00:00Z`, `--out DIR`, `--max-wait SECONDS`. Without a token the GitHub API allows 60 requests per hour, about 6,000 issues at 100 per page. The fetcher waits for a quota reset only if it is within `--max-wait` seconds (60 by default); otherwise it stops with a clear message and says the output is incomplete. A full run of all 19k+ issues therefore needs `--max-wait 3600`, which lets it sleep through the roughly three hourly resets. See [DESIGN.md](DESIGN.md) for why there is no token support.
 
-Without a token, the GitHub API allows 60 requests per hour, about 6,000 issues at 100 per page. The fetcher fails fast with a clear message instead of waiting out a long reset, and `--limit` keeps a demo run small.
+## Demo
+
+A real run, `issueflow --limit 150 --out out` (2 requests, about 2 seconds):
+
+```
+wrote 150 issues to out/ and 31 labels to by_label.csv
+```
+
+First rows of `by_label.csv` (these are the oldest issues in the repository, because pages are fetched oldest first):
+
+| label | total | open | stale | unassigned | median_open_age_days | median_days_to_close |
+|---|---|---|---|---|---|---|
+| verified | 58 | 0 | 0 | 0 | | 6 |
+| bug | 50 | 0 | 0 | 1 | | 7 |
+| feature-request | 39 | 1 | 1 | 17 | 4022 | 201.5 |
+| on-testplan | 8 | 0 | 0 | 2 | | 50.5 |
+| help wanted | 7 | 0 | 0 | 2 | | 117 |
+
+The output directory `out/` is gitignored.
