@@ -12,88 +12,67 @@ Streams the open and closed issues of `microsoft/vscode` from the GitHub REST AP
 4. Issues cross a **bounded queue** to the **main thread**, which computes the derived fields and appends rows to three CSV files.
 5. A final **aggregate** step streams the CSVs and writes `by_label.csv`.
 
-Every stage is a generator or a queue, so memory holds about one page (100 issues) at a time, not the 19,000+ issues of the full dataset.
+Every stage is a generator or a queue, so memory holds at most about 500 issues (the queue size) at a time, not the 19,000+ issues of the full dataset.
 
 ## Architecture
 
-Green boxes are the stages; the dashed arrows show which module starts and drains each thread.
+Two threads connected by one queue. Each box names the technology it uses and what it is for.
 
 ```mermaid
 flowchart LR
-    API[("GitHub REST API<br/>/repos/microsoft/vscode/issues")]
+    API["GitHub REST API<br/>HTTPS + JSON<br/>source of the issues"]
 
-    subgraph FETCH["Fetch thread"]
-        direction TB
-        SRC["GitHubIssuesSource<br/>paginate, drop PRs, apply limit,<br/>parse_issue()"]
-        LIM["RateLimiter<br/>wait for reset or fail fast"]
-        RET["RetryPolicy<br/>backoff on 5xx, URLError, timeout"]
-        HTTP["HttpClient<br/>urllib GET, raises HttpError"]
-        SRC -->|"1. before_request()"| LIM
-        SRC -->|"2. call(attempt)"| RET
-        RET -->|"3. get(url, params)"| HTTP
+    subgraph T1["Thread 1: fetcher"]
+        FETCH["Fetcher<br/>urllib, Link-header paging<br/>+ retry + rate limit<br/>gets pages, drops PRs"]
     end
 
-    Q[["Bounded queue<br/>backpressure"]]
+    Q["Queue<br/>queue.Queue, max 500<br/>hands issues across threads,<br/>slows the fetcher if the writer lags"]
 
-    subgraph MAIN["Main thread"]
-        direction TB
-        ENR["enrich(issue, as_of)<br/>derived fields"]
-        SINK["CsvSink<br/>streaming writer"]
-        ENR -->|"EnrichedIssue"| SINK
+    subgraph T2["Thread 2: main"]
+        XFORM["Transform<br/>pure Python function<br/>adds the 4 derived fields"]
+        SINK["CSV sink<br/>csv module, one row at a time<br/>writes the 3 files"]
     end
 
-    OUT1[/"issues.csv"/]
-    OUT2[/"issue_labels.csv"/]
-    OUT3[/"issue_assignees.csv"/]
-    AGG["aggregate<br/>stream CSVs, group by label"]
-    BY[/"by_label.csv"/]
+    FILES["issues.csv<br/>issue_labels.csv<br/>issue_assignees.csv<br/>database-ready output"]
+    AGG["Aggregate<br/>csv + statistics<br/>groups by label"]
+    BYLABEL["by_label.csv<br/>bonus summary"]
 
-    CLI["cli<br/>--repo --limit --as-of --out"]
-    CFG["config<br/>Settings"]
-    PIPE["pipeline<br/>wires stages, owns the thread and queue"]
-
-    API -->|"page + Link header"| HTTP
-    HTTP -->|"Response or HttpError"| SRC
-    SRC -->|"Issue"| Q
-    Q -->|"Issue"| ENR
-    SINK --> OUT1
-    SINK --> OUT2
-    SINK --> OUT3
-    OUT1 --> AGG
-    OUT2 --> AGG
-    AGG --> BY
-
-    CLI --> CFG --> PIPE
-    PIPE -.->|"starts"| FETCH
-    PIPE -.->|"drains"| MAIN
-
-    classDef stage fill:#e8f4ea,stroke:#2e7d32,color:#1b1b1b;
-    classDef glue fill:#e3f2fd,stroke:#1565c0,color:#1b1b1b;
-    class SRC,LIM,RET,HTTP,ENR,SINK,AGG stage;
-    class Q,CLI,CFG,PIPE glue;
+    API -->|"JSON pages"| FETCH
+    FETCH -->|"Issue"| Q
+    Q -->|"Issue"| XFORM
+    XFORM -->|"EnrichedIssue"| SINK
+    SINK -->|"rows"| FILES
+    FILES -->|"read back"| AGG
+    AGG --> BYLABEL
 ```
 
-The same flow in plain text:
+Plain-text version of the same flow:
 
 ```
-                    FETCH THREAD                               MAIN THREAD
-  ┌────────────────────────────────────────────┐        ┌───────────────────────────────┐
-  │ GitHubIssuesSource                         │        │ enrich(issue, as_of)          │
-  │   paginate via Link header                 │        │   open_age_days               │
-  │   drop pull requests, apply --limit        │ Issue  │   days_since_update           │
-  │   parse_issue(raw) -> Issue          ──────┼──────► │   is_unassigned, is_stale     │
-  │      │                                     │ bounded│              │                │
-  │      │ 1. RateLimiter.before_request()     │ queue  │              ▼ EnrichedIssue  │
-  │      │ 2. RetryPolicy.call(attempt)        │        │ CsvSink                       │
-  │      ▼ 3. HttpClient.get(url, params)      │        └──────────────┬────────────────┘
-  └──────┼─────────────────────────────────────┘                       │ rows
-         ▼                                                             ▼
-   GitHub REST API                                      issues.csv  issue_labels.csv  issue_assignees.csv
-                                                                  │          │
-                                                                  └────┬─────┘
-                                                                       ▼
-                                                  aggregate ──► by_label.csv
+GitHub API --> [Fetcher] --> [Queue, max 500] --> [Transform] --> [CSV sink] --> 3 CSV files --> [Aggregate] --> by_label.csv
+               thread 1       between threads     thread 2         thread 2                       reads the CSVs
 ```
+
+`pipeline.py` starts the fetcher thread, owns the queue and runs the main thread. `cli.py` and `config.py` read the options and choose the concrete source and sink.
+
+### Modules at a glance
+
+| Module | What it does | Technology |
+|---|---|---|
+| `models.py` | Defines `Issue` and `EnrichedIssue`, the data handed from stage to stage. | `dataclasses` (frozen) |
+| `sources/base.py` | Defines the `Source` contract: a lazy stream of raw records. | `typing.Protocol` |
+| `sources/http.py` | Makes one GET request and raises `HttpError` on any non-2xx reply. | `urllib.request`, `json` |
+| `sources/retry.py` | Retries temporary failures (5xx, network errors, timeouts) with growing, randomized delays. | exponential backoff, full jitter |
+| `sources/rate_limit.py` | Reads GitHub's quota headers and waits for the reset, or stops if the wait is too long. | `X-RateLimit-*`, `Retry-After` headers |
+| `sources/github.py` | Fetches every page of issues, skips pull requests, applies `--limit`, and parses each into an `Issue`. | `Link` header paging, `datetime` |
+| `transforms/derived.py` | Computes `open_age_days`, `days_since_update`, `is_unassigned` and `is_stale` for one issue. | pure function, `datetime` |
+| `sinks/base.py` | Defines the `Sink` contract: write one item, close. | `typing.Protocol` |
+| `sinks/csv_sink.py` | Writes each issue as one row in `issues.csv` plus child rows in the labels and assignees files. | `csv` module, streaming |
+| `pipeline.py` | Runs fetcher and writer at the same time and passes errors between the two threads. | `threading`, `queue.Queue` |
+| `aggregate.py` | Reads the CSVs and writes per-label counts and medians to `by_label.csv`. | `csv`, `statistics`, merge join |
+| `config.py` | Holds the validated run settings: repo, limit, `as_of`, output folder, wait cap. | frozen `dataclass` |
+| `cli.py` | Parses options, wires everything together, prints a summary, and turns failures into exit codes. | `argparse` |
+| `__main__.py` | Lets you run the tool as `python -m issueflow`. | standard module entry point |
 
 ### What one page request does
 
@@ -233,7 +212,7 @@ Frozen dataclasses `Issue` and `EnrichedIssue` (see Data model). Frozen so a sta
 - `parse_as_of(text)`: ISO 8601; a value without a timezone is taken as UTC.
 - `python -m issueflow` runs `main()`.
 
-### `tests/` (built for existing modules)
+### `tests/` (built)
 - Mirrors `src/`. Tests inject a fake `opener`, clock, `sleep` and `random`, so they run in milliseconds and never touch the network.
 - The suite (137 tests) covers retry counts and give-up, the rate-limit wait and fail-fast paths, Link pagination, PR filtering, limit edge cases, the stale boundary at 30 versus 31 days, CSV formatting, the merge join, and the pipeline's bounded queue and error propagation in both directions.
 
